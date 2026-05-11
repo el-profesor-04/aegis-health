@@ -1,0 +1,51 @@
+phrase_a,phrase_b,canonical_a,canonical_b,label,score,prediction
+knee pain,pain in knee,knee pain,knee pain,1,1.0000000000000002,1
+my knee hurts,knee pain,knee pain,knee pain,1,1.0000000000000002,1
+sharp pain in lower back,lower back pain,lower back pain,lower back pain,1,1.0,1
+headache,pain in head,headache,head pain,1,0.8790335381535065,1
+stomach ache,abdominal pain,abdominal pain,abdominal pain,1,0.9999999999999998,1
+sore throat,throat pain,sore throat,throat pain,1,0.8743986144693766,1
+feeling nauseous,nausea,nausea,nausea,1,1.0,1
+dizzy,feeling lightheaded,dizziness,lightheadedness,1,0.8647093926167323,1
+my chest feels tight,chest tightness,chest tightness,chest tightness,1,1.0,1
+heart is racing,rapid heartbeat,heart rate increase,heart rate,1,0.9053859971643138,1
+pressure behind my eyes,eye strain,pressure behind eyes,eye strain,1,0.7035959629913474,0
+my head feels heavy,headache,head heaviness,headache,1,0.7100984428774431,0
+uneasy stomach,nausea,abdominal discomfort,nausea,1,0.7361221246182619,1
+room spinning feeling,dizziness,vertigo,dizziness,1,0.8623252875740038,1
+burning feeling in chest,acid reflux,chest burning,acid reflux,1,0.5898872599757763,0
+pins and needles in fingers,tingling in fingers,paresthesia,tingling,1,0.6472611396235489,0
+hard to catch my breath,shortness of breath,dyspnea,shortness of breath,1,0.8285824736552155,1
+tight feeling in neck,neck stiffness,neck tightness,neck stiffness,1,0.7971605138884047,1
+cramps in my belly,abdominal cramps,abdominal cramping,abdominal pain,1,0.9108900527074931,1
+feeling drained and weak,fatigue,fatigue,fatigue,1,1.0,1
+knee pain,headache,knee pain,headache,0,0.5546510426847848,0
+stomach ache,chest pain,abdominal pain,chest pain,0,0.6760193568082828,0
+dizziness,skin rash,dizziness,rash,0,0.6463949046419866,0
+sore throat,back pain,sore throat,back pain,0,0.599985929321384,0
+nausea,leg cramps,nausea,cramp,0,0.6806828991757504,0
+blurred vision,ear pain,blurred vision,ear pain,0,0.5577029384341621,0
+shortness of breath,finger pain,shortness of breath,finger pain,0,0.5631279705857399,0
+fatigue,ankle swelling,fatigue,ankle swelling,0,0.5619933587432367,0
+toothache,abdominal pain,tooth pain,abdominal pain,0,0.6690866727230274,0
+itchy skin,joint pain,skin itching,joint pain,0,0.5509833654622565,0
+chest pain,heartburn,chest pain,heartburn,0,0.7276320839788057,0
+headache,migraine,headache,migraine,0,0.8332460805814939,1
+back stiffness,back pain,back stiffness,back pain,0,0.7990713768706293,1
+fatigue,sleepiness,fatigue,sleepiness,0,0.8306679335419267,1
+anxiety,rapid heartbeat,anxiety,heart rate,0,0.6106760692325436,0
+nausea,loss of appetite,nausea,loss of appetite,0,0.6945563546396598,0
+joint pain,muscle soreness,joint pain,muscle soreness,0,0.7289094043159519,0
+fever,feeling warm,fever,warmth,0,0.7127297303500663,0
+dizziness,blurred vision,dizziness,blurred vision,0,0.6906167744005414,0
+tingling,numbness,tingling,numbness,0,0.706307966028747,0
+left knee pain,knee pain,knee pain,knee pain,1,1.0000000000000002,1
+right shoulder hurts,shoulder pain,shoulder pain,shoulder pain,1,1.0,1
+pain in upper back,back pain,pain,back pain,1,0.7097691629987612,0
+neck pain,upper spine pain,neck pain,spine pain,1,0.8201031316807973,1
+wrist pain,hand pain,wrist pain,hand pain,0,0.8152786686518521,1
+ankle pain,foot pain,ankle pain,foot pain,0,0.8667341283914618,1
+lower abdominal pain,stomach pain,abdominal pain,stomach pain,1,0.8593928638293779,1
+pain in fingers,hand pain,finger pain,hand pain,1,0.864799688441924,1
+eye pain,pain behind eyes,eye pain,pain behind eyes,1,0.7723678792909393,1
+jaw pain,tooth pain,jaw pain,tooth pain,0,0.7518526552059522,1
