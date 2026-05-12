@@ -1,3 +1,5 @@
 numpy
 openai
 sentence-transformers
+fastapi
+uvicorn

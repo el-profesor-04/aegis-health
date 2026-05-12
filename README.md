@@ -31,7 +31,14 @@ FEATS TO ADD:
 
 - Relevancy calculations when on charge. To update DB. On idle use.
 
+- Visualize health graph, use human animation object and maybe arrows pointing out of it.
 
 PENDING ITEMS:
 
 - EPISODE CONNECTIONS / MERGE
+
+- MULTI EVENT EXTRACTION
+
+- Second, self-contained events are under-modeled. For example, food/activity/sleep events can be valid without symptom/body/trigger, but there is no dedicated field like activity,food_item, medication, or sleep_metric. That means events like “Sunday run” may become just activity, and many different activities could collapse into the same canonical event name.
+
+- Third, episodes are still using older heuristic logic: hardcoded TIME_WINDOW_DAYS = 10, score weights, and embedding similarity in aegis/ingestion/episodes.py:4. Compared to the newer impact/relevance layer, episodes are now the least mature part.
