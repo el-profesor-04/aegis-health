@@ -17,19 +17,30 @@ def ingest(request: IngestRequest, graph=Depends(get_graph)):
             request.text,
             reference_time=request.reference_time,
         )
+
+        # Extraction failed (LLM returned nothing parseable or validation
+        # rejected the output). Return 200 with success=False instead of
+        # crashing — the caller can log the skip and continue.
         if event_id is None:
-            raise HTTPException(status_code=422, detail="Input could not be converted into a valid event.")
+            return IngestResponse(
+                event_id=None,
+                success=False,
+                skip_reason="Input could not be converted into a valid event.",
+                cyclic_promotions=[],
+                node_count=len(graph.nodes),
+                edge_count=len(graph.edges),
+            )
 
         promotions = run_cyclic_detection(graph)
         graph.persist_all()
 
         return IngestResponse(
             event_id=event_id,
+            success=True,
             cyclic_promotions=promotions,
             node_count=len(graph.nodes),
             edge_count=len(graph.edges),
         )
-    except HTTPException:
-        raise
+
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -119,13 +119,21 @@ def get_temporal_metadata(data, reference_time=None):
 # These event types are valid on their own — the type itself carries meaning
 # even when symptom / body_part / trigger are all null.
 # e.g. "Slept 5 hours" → sleep event with no symptom is still useful.
+# Types that are meaningful on their own — no symptom/body/trigger needed
 SELF_CONTAINED_EVENT_TYPES = {"sleep", "mood", "food", "activity", "medication"}
 
 
 def is_valid_event(data: dict) -> bool:
-    event_type = data.get("event_type")
+    event_type    = data.get("event_type")
+    impact_class  = data.get("impact_class")
+
     if not event_type:
         return False
+
+    # C5 (Chronic) events always pass — diagnoses, allergies, long-term
+    # conditions are valid health data regardless of how the LLM typed them.
+    if impact_class == "C5":
+        return True
 
     if event_type in SELF_CONTAINED_EVENT_TYPES:
         return True
@@ -133,8 +141,14 @@ def is_valid_event(data: dict) -> bool:
     if event_type == "symptom":
         return bool(data.get("symptom"))
 
-    # "other" — needs at least one meaningful field
-    return bool(data.get("symptom") or data.get("body_parts") or data.get("trigger"))
+    # "other" — pass if ANY meaningful field is present, including trigger.
+    # e.g. "I have a peanut allergy" → trigger="peanut", event_type="other"
+    return bool(
+        data.get("symptom")
+        or data.get("body_parts")
+        or data.get("trigger")
+        or data.get("impact_class") in {"C2", "C3", "C4"}
+    )
 
 
 # ---------------------------------------------------------------------------

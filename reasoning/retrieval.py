@@ -1,3 +1,34 @@
+"""
+reasoning/retrieval.py
+──────────────────────
+Three-phase retrieval over the Aegis health graph.
+
+Phase 1 — Seed finding
+    LLM extracts entities from the query. Each entity is embedded and matched
+    against all graph nodes (state nodes, episode nodes) by cosine similarity.
+    Lexical string matching supplements embedding search for direct name hits.
+
+Phase 2 — Beam traversal
+    Multi-start graph traversal from all seeds simultaneously. Maintains a
+    priority beam of the top BEAM_WIDTH nodes at each hop. Event nodes
+    encountered at any depth are collected as candidates. Traversal is
+    bidirectional (follows edges in both directions).
+
+Phase 3 — Reranking
+    Candidates are scored by three independent signals:
+      A. Graph score      — path quality from beam traversal
+      B. Temporal decay   — Relevance(t) from utils/relevance.py
+      C. Semantic score   — cosine similarity between query embedding and
+                            each event's raw_text embedding  ← KEY NEW PIECE
+
+    C5 (Chronic) events are always surfaced as a supplementary band,
+    regardless of graph proximity or query keywords.
+
+    Final score = A * w_graph + B * w_temporal + C * w_semantic
+
+    Top LIMIT events are returned to the generator.
+"""
+
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -15,6 +46,47 @@ client = OpenAI(
     max_retries=0,
 )
 
+
+# ── Scoring weights ────────────────────────────────────────────────────────
+W_GRAPH    = 0.30   # beam traversal proximity
+W_TEMPORAL = 0.20   # time-decay relevance (Relevance(t) formula)
+W_SEMANTIC = 0.50   # query ↔ raw_text embedding similarity  ← dominates
+
+# ── Beam parameters ────────────────────────────────────────────────────────
+BEAM_WIDTH  = 60    # max nodes to carry between hops (was 20, too small)
+MAX_DEPTH   = 5     # max hops from seed
+DEPTH_DECAY = 0.85  # per-hop score multiplier (was 0.72, too steep)
+
+# ── Seed finding ───────────────────────────────────────────────────────────
+MIN_SEED_SIMILARITY = 0.72   # minimum embedding sim for a node to be a seed
+TOP_K_PER_ENTITY    = 12     # candidate nodes per entity before sim filter
+
+# ── Edge traversal ─────────────────────────────────────────────────────────
+TRAVERSABLE_RELATIONS = {
+    "HAS_SYMPTOM",
+    "TARGETS",
+    "TRIGGERED_BY",
+    "HAS_EVENT",
+    "PART_OF",
+}
+
+RELATION_WEIGHTS = {
+    "HAS_SYMPTOM":  1.25,   # symptom links are semantically strong
+    "TARGETS":      1.10,
+    "TRIGGERED_BY": 1.20,   # causal links are important
+    "HAS_EVENT":    1.15,   # episode → event is the core cluster edge
+    "PART_OF":      0.80,   # anatomical hierarchy: lower priority
+}
+
+STOPWORDS = {
+    "about", "after", "again", "could", "from", "have", "health", "know",
+    "memory", "recently", "should", "that", "the", "this", "what", "with",
+    "your", "caused", "issues", "relevant", "stay", "simple", "question",
+    "also", "been", "does", "into", "more", "some", "then", "when",
+}
+
+
+# ── Query entity extraction ────────────────────────────────────────────────
 
 QUERY_EXTRACTION_PROMPT = """
 You extract search entities from a user's health question.
@@ -34,10 +106,10 @@ Schema:
 
 Rules:
 - Use concise SNOMED-style clinical terms where possible.
-- Prefer singular canonical terms: "migraine" not "migraines", "headache" not "headaches".
-- Include likely graph search anchors: symptoms, body parts, foods, medications, activities, conditions, and triggers.
+- Prefer singular canonical terms: "migraine" not "migraines".
+- Include symptoms, body parts, foods, medications, activities, conditions, triggers.
 - Do not include filler words.
-- Keep each entity short.
+- Keep each entity short (1–3 words).
 
 Example:
 Input: "Could sushi from yesterday have caused my nausea?"
@@ -52,74 +124,40 @@ Output:
 """
 
 
-TRAVERSABLE_RELATIONS = {
-    "HAS_SYMPTOM",
-    "TARGETS",
-    "TRIGGERED_BY",
-    "HAS_EVENT",
-    "PART_OF",
-}
-
-RELATION_WEIGHTS = {
-    "HAS_SYMPTOM": 1.20,
-    "TARGETS": 1.05,
-    "TRIGGERED_BY": 1.15,
-    "HAS_EVENT": 1.10,
-    "PART_OF": 0.80,
-}
-
-MIN_SEED_SIMILARITY = 0.75
-
-STOPWORDS = {
-    "about", "after", "again", "could", "from", "have", "health", "know",
-    "memory", "recently", "should", "that", "the", "this", "what", "with",
-    "your", "caused", "issues", "relevant", "stay", "simple", "question",
-}
-
-CHRONIC_QUERY_TERMS = {"chronic", "permanent", "long", "longterm", "long-term", "ongoing"}
-
-
-def _metadata(row):
-    value = row.get("metadata", {})
-    return value if isinstance(value, dict) else {}
+def _extract_first_json_object(text):
+    depth, start = 0, None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start:i + 1]
+    return text
 
 
 def _tokens(text):
     if not text:
         return set()
-
-    cleaned = []
-    for char in str(text).lower():
-        cleaned.append(char if char.isalnum() else " ")
-
-    return {
-        token for token in "".join(cleaned).split()
-        if len(token) > 2 and token not in STOPWORDS
-    }
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in str(text).lower())
+    return {t for t in cleaned.split() if len(t) > 2 and t not in STOPWORDS}
 
 
-def _extract_first_json_object(text):
-    depth = 0
-    start = None
-    for index, char in enumerate(text):
-        if char == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                return text[start:index + 1]
-    return text
+def _dedupe_entities(entities):
+    seen, deduped = set(), []
+    for e in entities:
+        text = normalize_concept(e.get("text"))
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append({"text": text, "type": e.get("type") or "other"})
+    return deduped
 
 
 def extract_query_entities(query, model="gemma-4-e2b"):
-    """
-    LLM-backed query understanding for retrieval.
-
-    If the local model is unavailable, falls back to a conservative token-based
-    entity list so tests and offline development still work.
-    """
+    """LLM-backed query understanding. Falls back to token extraction."""
     try:
         response = client.chat.completions.create(
             model=model,
@@ -132,17 +170,13 @@ def extract_query_entities(query, model="gemma-4-e2b"):
         text = response.choices[0].message.content.strip()
         if text.startswith("```"):
             text = "\n".join(
-                line for line in text.splitlines()
-                if not line.strip().startswith("```")
+                l for l in text.splitlines() if not l.strip().startswith("```")
             ).strip()
         data = json.loads(_extract_first_json_object(text))
         entities = [
-            {
-                "text": normalize_concept(item.get("text")),
-                "type": item.get("type") or "other",
-            }
-            for item in data.get("entities", [])
-            if normalize_concept(item.get("text"))
+            {"text": normalize_concept(e.get("text")), "type": e.get("type") or "other"}
+            for e in data.get("entities", [])
+            if normalize_concept(e.get("text"))
         ]
         return {
             "entities": _dedupe_entities(entities),
@@ -150,114 +184,111 @@ def extract_query_entities(query, model="gemma-4-e2b"):
             "source": "llm",
         }
     except Exception:
-        fallback_entities = [
-            {"text": token, "type": "other"}
-            for token in sorted(_tokens(query))
-        ]
+        fallback = [{"text": t, "type": "other"} for t in sorted(_tokens(query))]
         return {
-            "entities": _dedupe_entities(fallback_entities),
+            "entities": _dedupe_entities(fallback),
             "intent": "general",
             "source": "fallback",
         }
 
 
-def _dedupe_entities(entities):
-    seen = set()
-    deduped = []
-    for entity in entities:
-        text = normalize_concept(entity.get("text"))
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        deduped.append({"text": text, "type": entity.get("type") or "other"})
-    return deduped
-
+# ── Seed finding ───────────────────────────────────────────────────────────
 
 def _term_variants(text):
     text = normalize_concept(text)
     if not text:
         return set()
-
     variants = {text}
     tokens = text.split()
 
-    def singularize(token):
-        if len(token) > 4 and token.endswith("ies"):
-            return token[:-3] + "y"
-        if len(token) > 3 and token.endswith("es"):
-            return token[:-2]
-        if len(token) > 3 and token.endswith("s"):
-            return token[:-1]
-        return token
+    def singularize(t):
+        if len(t) > 4 and t.endswith("ies"):
+            return t[:-3] + "y"
+        if len(t) > 3 and t.endswith("es"):
+            return t[:-2]
+        if len(t) > 3 and t.endswith("s"):
+            return t[:-1]
+        return t
 
-    singular_tokens = [singularize(token) for token in tokens]
-    singular_text = " ".join(singular_tokens)
-    variants.add(singular_text)
-
-    return {variant for variant in variants if variant}
+    variants.add(" ".join(singularize(t) for t in tokens))
+    return {v for v in variants if v}
 
 
-def _iter_embedding_nodes(graph):
-    for _, row in graph.nodes.iterrows():
-        if row.get("embedding") is not None:
-            yield row
-
-
-def find_embedding_seed_nodes(graph, entities, top_k_per_entity=10):
+def find_seed_nodes(graph, entities, top_k=TOP_K_PER_ENTITY):
     """
-    Convert query entities to embeddings and find the closest graph nodes.
-    Returns unique seed nodes, preserving each seed's best entity match.
+    Find graph nodes that best match query entities.
+    Uses TWO passes:
+      Pass 1 — Embedding similarity (all nodes with stored embeddings)
+      Pass 2 — Lexical string matching (all nodes, regardless of embedding)
+    Results are merged and deduplicated, keeping the best score per node.
     """
     best_by_node = {}
 
     for entity in entities:
         entity_text = entity["text"]
+        variants    = _term_variants(entity_text)
+
+        # ── Pass 1: Embedding similarity ──────────────────────────────
         try:
-            query_embedding = get_embedding(entity_text)
+            q_emb   = get_embedding(entity_text)
+            scored  = []
+            for _, row in graph.nodes.iterrows():
+                emb = row.get("embedding")
+                if emb is None:
+                    continue
+                try:
+                    sim = float(cosine_similarity(q_emb, emb))
+                except Exception:
+                    continue
+                scored.append((sim, row))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            for sim, row in scored[:top_k]:
+                name = str(row["canonical_name"]).lower()
+                exact = any(v in name or name in v for v in variants)
+                if sim < MIN_SEED_SIMILARITY and not exact:
+                    continue
+                _update_best(best_by_node, row, float(sim), entity_text, entity.get("type"))
         except Exception:
-            continue
+            pass
 
-        scored = []
-        for row in _iter_embedding_nodes(graph):
-            try:
-                score = cosine_similarity(query_embedding, row["embedding"])
-            except Exception:
+        # ── Pass 2: Lexical string matching ───────────────────────────
+        # Catches nodes whose embeddings weren't stored (rare after the
+        # canonicalizer fix) and provides a hard anchor for exact matches.
+        for _, row in graph.nodes.iterrows():
+            name = str(row.get("canonical_name") or "").lower()
+            if not name:
                 continue
-            scored.append((score, row))
-
-        scored.sort(key=lambda item: item[0], reverse=True)
-
-        for score, row in scored[:top_k_per_entity]:
-            name = str(row["canonical_name"]).lower()
-            exactish = any(
-                variant in name or name in variant
-                for variant in _term_variants(entity_text)
-            )
-            if score < MIN_SEED_SIMILARITY and not exactish:
-                continue
-
-            node_id = row["node_id"]
-            existing = best_by_node.get(node_id)
-            if existing is None or score > existing["seed_score"]:
-                best_by_node[node_id] = {
-                    "node_id": node_id,
-                    "name": row["canonical_name"],
-                    "type": row["type"],
-                    "seed_score": float(score),
-                    "matched_entity": entity_text,
-                    "matched_entity_type": entity.get("type", "other"),
-                }
+            if any(v in name or name in v for v in variants):
+                # Assign a fixed high score for direct string hits so they
+                # aren't beaten by weak embedding matches.
+                _update_best(best_by_node, row, 0.90, entity_text, entity.get("type"))
 
     seeds = list(best_by_node.values())
-    seeds.sort(key=lambda item: item["seed_score"], reverse=True)
+    seeds.sort(key=lambda s: s["seed_score"], reverse=True)
     return seeds
 
 
+def _update_best(best_by_node, row, score, entity_text, entity_type):
+    node_id  = row["node_id"]
+    existing = best_by_node.get(node_id)
+    if existing is None or score > existing["seed_score"]:
+        best_by_node[node_id] = {
+            "node_id":             node_id,
+            "name":                row["canonical_name"],
+            "type":                row["type"],
+            "seed_score":          score,
+            "matched_entity":      entity_text,
+            "matched_entity_type": entity_type or "other",
+        }
+
+
+# ── Graph traversal ────────────────────────────────────────────────────────
+
 def _node_row(graph, node_id):
     row = graph.get_node(node_id)
-    if row.empty:
-        return None
-    return row.iloc[0]
+    return None if row.empty else row.iloc[0]
 
 
 def _neighbors(graph, node_id):
@@ -266,29 +297,121 @@ def _neighbors(graph, node_id):
             (graph.edges["source_id"] == node_id) |
             (graph.edges["target_id"] == node_id)
         ) &
-        (graph.edges["relation"].isin(TRAVERSABLE_RELATIONS))
+        graph.edges["relation"].isin(TRAVERSABLE_RELATIONS)
     ]
-
     neighbors = []
     for _, edge in edges.iterrows():
-        if edge["source_id"] == node_id:
-            other_id = edge["target_id"]
-            direction = "out"
-        else:
-            other_id = edge["source_id"]
-            direction = "in"
-
+        other_id  = edge["target_id"] if edge["source_id"] == node_id else edge["source_id"]
+        direction = "out" if edge["source_id"] == node_id else "in"
         neighbors.append({
-            "node_id": other_id,
+            "node_id":  other_id,
             "relation": edge["relation"],
             "direction": direction,
         })
-
     return neighbors
 
 
+def beam_search_events(graph, seeds, beam_width=BEAM_WIDTH,
+                        max_depth=MAX_DEPTH, now=None):
+    """
+    Multi-start beam traversal. Collects all event nodes reachable from seeds
+    within max_depth hops. Returns scored event candidates.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    # Initialise beam from all seeds simultaneously
+    beam = [
+        {
+            "node_id": s["node_id"],
+            "score":   s["seed_score"],
+            "depth":   0,
+            "path":    [{
+                "node_id":        s["node_id"],
+                "name":           s["name"],
+                "type":           s["type"],
+                "matched_entity": s["matched_entity"],
+                "seed_score":     s["seed_score"],
+            }],
+        }
+        for s in seeds
+    ]
+
+    event_hits  = {}     # node_id → best hit dict
+    best_seen   = defaultdict(float)   # node_id → best score seen
+
+    for _depth in range(max_depth + 1):
+        next_beam = []
+
+        for item in beam:
+            row = _node_row(graph, item["node_id"])
+            if row is None:
+                continue
+
+            # Collect event nodes encountered at any depth
+            if row["type"] == "event":
+                relevance = score_node_relevance(row.to_dict(), now)
+                hit       = event_hits.get(row["node_id"])
+                if hit is None:
+                    event_hits[row["node_id"]] = {
+                        "row":             row,
+                        "graph_score":     item["score"],
+                        "relevance_score": relevance,
+                        "paths":           [item["path"]],
+                    }
+                else:
+                    if item["score"] > hit["graph_score"]:
+                        hit["graph_score"] = item["score"]
+                    if relevance > hit["relevance_score"]:
+                        hit["relevance_score"] = relevance
+                    hit["paths"].append(item["path"])
+
+            if item["depth"] >= max_depth:
+                continue
+
+            for neighbor in _neighbors(graph, item["node_id"]):
+                rel_weight  = RELATION_WEIGHTS.get(neighbor["relation"], 1.0)
+                next_score  = item["score"] * rel_weight * DEPTH_DECAY
+                neighbor_id = neighbor["node_id"]
+
+                if next_score <= best_seen[neighbor_id]:
+                    continue
+                best_seen[neighbor_id] = next_score
+
+                n_row = _node_row(graph, neighbor_id)
+                if n_row is None:
+                    continue
+
+                next_beam.append({
+                    "node_id": neighbor_id,
+                    "score":   next_score,
+                    "depth":   item["depth"] + 1,
+                    "path":    item["path"] + [{
+                        "node_id":   neighbor_id,
+                        "name":      n_row["canonical_name"],
+                        "type":      n_row["type"],
+                        "relation":  neighbor["relation"],
+                        "direction": neighbor["direction"],
+                        "score":     next_score,
+                    }],
+                })
+
+        next_beam.sort(key=lambda x: x["score"], reverse=True)
+        beam = next_beam[:beam_width]
+        if not beam:
+            break
+
+    return list(event_hits.values())
+
+
+# ── Event context helpers ──────────────────────────────────────────────────
+
+def _metadata(row):
+    v = row.get("metadata", {})
+    return v if isinstance(v, dict) else {}
+
+
 def _event_context(graph, event_id):
-    edges = graph.edges[graph.edges["source_id"] == event_id]
+    edges  = graph.edges[graph.edges["source_id"] == event_id]
     states = []
     for _, edge in edges.iterrows():
         if edge["relation"] not in {"HAS_SYMPTOM", "TARGETS", "TRIGGERED_BY"}:
@@ -298,8 +421,8 @@ def _event_context(graph, event_id):
             continue
         states.append({
             "relation": edge["relation"],
-            "node_id": node["node_id"],
-            "name": node["canonical_name"],
+            "node_id":  node["node_id"],
+            "name":     node["canonical_name"],
         })
     return states
 
@@ -312,369 +435,292 @@ def _episode_ids(graph, event_id):
     return list(edges["source_id"])
 
 
-def _event_to_evidence(graph, event_row, graph_score, relevance_score, paths):
-    md = _metadata(event_row)
+def _build_evidence(graph, hit, query_sim=0.0):
+    """Build the evidence dict the generator consumes."""
+    row = hit["row"]
+    md  = _metadata(row)
     return {
-        "event_id": event_row["node_id"],
-        "name": event_row["canonical_name"],
-        "raw_text": md.get("raw_text"),
-        "event_type": event_row.get("event_type") or md.get("event_type"),
-        "event_time": event_row.get("event_time") or md.get("event_time"),
+        "event_id":         row["node_id"],
+        "name":             row["canonical_name"],
+        "raw_text":         md.get("raw_text"),
+        "event_type":       row.get("event_type") or md.get("event_type"),
+        "event_time":       row.get("event_time") or md.get("event_time"),
         "event_day_offset": md.get("event_day_offset"),
-        "severity_band": event_row.get("severity_band") or md.get("severity_band"),
-        "impact_class": event_row.get("impact_class") or md.get("impact_class"),
-        "impact_label": md.get("impact_label"),
-        "S0": event_row.get("S0") or md.get("S0"),
-        "lambda_hr": event_row.get("lambda_hr") or md.get("lambda_hr"),
-        "is_cyclic": bool(event_row.get("is_cyclic") or md.get("is_cyclic", False)),
-        "cyclic_period_hrs": event_row.get("cyclic_period_hrs") or md.get("cyclic_period_hrs"),
-        "occurrence_count": event_row.get("occurrence_count") or md.get("occurrence_count"),
-        "relevance_score": float(relevance_score),
-        "graph_score": float(graph_score),
-        "score": float(graph_score + relevance_score),
+        "severity_band":    row.get("severity_band") or md.get("severity_band"),
+        "impact_class":     row.get("impact_class") or md.get("impact_class"),
+        "impact_label":     md.get("impact_label"),
+        "S0":               row.get("S0") or md.get("S0"),
+        "lambda_hr":        row.get("lambda_hr") or md.get("lambda_hr"),
+        "is_cyclic":        bool(row.get("is_cyclic") or md.get("is_cyclic", False)),
+        "cyclic_period_hrs": row.get("cyclic_period_hrs") or md.get("cyclic_period_hrs"),
+        "occurrence_count": row.get("occurrence_count") or md.get("occurrence_count"),
+        "relevance_score":  float(hit["relevance_score"]),
+        "graph_score":      float(hit["graph_score"]),
+        "query_sim":        float(query_sim),
+        "score":            0.0,    # filled in by rerank
         "entity_match_score": 0.0,
         "matched_entities": [],
-        "states": _event_context(graph, event_row["node_id"]),
-        "episode_ids": _episode_ids(graph, event_row["node_id"]),
-        "paths": paths[:3],
+        "states":           _event_context(graph, row["node_id"]),
+        "episode_ids":      _episode_ids(graph, row["node_id"]),
+        "paths":            hit["paths"][:3],
     }
 
 
-def beam_search_events(graph, seeds, beam_width=20, max_depth=4, now=None):
+# ── Semantic reranking ─────────────────────────────────────────────────────
+
+def _score_semantic(events, query):
     """
-    Multi-start beam traversal over the health graph.
-
-    Starts from embedding-matched state/episode nodes, walks edges in both
-    directions, and collects event nodes encountered along the way. Event rank
-    combines graph proximity/path score with temporal impact relevance.
+    Embed the full query ONCE, then score each event's raw_text by cosine
+    similarity. This is the key signal that was previously missing.
+    Falls back gracefully if embedding fails.
     """
-    now = now or datetime.now(timezone.utc)
-    beam = []
+    try:
+        q_emb = get_embedding(query)
+    except Exception:
+        for e in events:
+            e["query_sim"] = 0.0
+        return events
 
-    for seed in seeds:
-        beam.append({
-            "node_id": seed["node_id"],
-            "score": seed["seed_score"],
-            "depth": 0,
-            "path": [{
-                "node_id": seed["node_id"],
-                "name": seed["name"],
-                "type": seed["type"],
-                "matched_entity": seed["matched_entity"],
-                "seed_score": seed["seed_score"],
-            }],
-        })
-
-    event_hits = {}
-    best_seen = defaultdict(float)
-
-    for _ in range(max_depth + 1):
-        next_beam = []
-
-        for item in beam:
-            row = _node_row(graph, item["node_id"])
-            if row is None:
-                continue
-
-            if row["type"] == "event":
-                relevance = score_node_relevance(row.to_dict(), now)
-                existing = event_hits.get(row["node_id"])
-                path = item["path"]
-                if existing is None:
-                    event_hits[row["node_id"]] = {
-                        "row": row,
-                        "graph_score": item["score"],
-                        "relevance_score": relevance,
-                        "paths": [path],
-                    }
-                else:
-                    existing["graph_score"] = max(existing["graph_score"], item["score"])
-                    existing["relevance_score"] = max(existing["relevance_score"], relevance)
-                    existing["paths"].append(path)
-
-            if item["depth"] >= max_depth:
-                continue
-
-            for neighbor in _neighbors(graph, item["node_id"]):
-                relation_weight = RELATION_WEIGHTS.get(neighbor["relation"], 1.0)
-                depth_penalty = 0.72
-                next_score = item["score"] * relation_weight * depth_penalty
-                neighbor_id = neighbor["node_id"]
-
-                if next_score <= best_seen[neighbor_id]:
-                    continue
-                best_seen[neighbor_id] = next_score
-
-                neighbor_row = _node_row(graph, neighbor_id)
-                if neighbor_row is None:
-                    continue
-
-                next_beam.append({
-                    "node_id": neighbor_id,
-                    "score": next_score,
-                    "depth": item["depth"] + 1,
-                    "path": item["path"] + [{
-                        "node_id": neighbor_id,
-                        "name": neighbor_row["canonical_name"],
-                        "type": neighbor_row["type"],
-                        "relation": neighbor["relation"],
-                        "direction": neighbor["direction"],
-                        "score": next_score,
-                    }],
-                })
-
-        next_beam.sort(key=lambda item: item["score"], reverse=True)
-        beam = next_beam[:beam_width]
-        if not beam:
-            break
-
-    evidence = []
-    for hit in event_hits.values():
-        evidence.append(_event_to_evidence(
-            graph,
-            hit["row"],
-            hit["graph_score"],
-            hit["relevance_score"],
-            hit["paths"],
-        ))
-
-    evidence.sort(key=lambda item: item["score"], reverse=True)
-    return evidence
-
-
-def build_evidence_bundle(graph, query, limit=20, now=None):
-    now = now or datetime.now(timezone.utc)
-    query_plan = extract_query_entities(query)
-    seeds = []
-    events = []
-
-    if query_plan.get("source") != "fallback":
-        seeds = find_embedding_seed_nodes(graph, query_plan["entities"])
-        events = beam_search_events(graph, seeds, beam_width=20, max_depth=4, now=now)
-
-    if not events:
-        events = lexical_event_fallback(graph, query, now=now)
-
-    events.extend(class_based_events(graph, query, now=now))
-    events = _dedupe_events(events)
-    events = rerank_events(events, query_plan, query)
-
-    top_events = events[:limit]
-    return {
-        "query": query,
-        "query_time": now.isoformat(),
-        "query_plan": query_plan,
-        "seed_nodes": seeds[:20],
-        "events": top_events,
-        "missing_information": _infer_missing_information(query_plan, top_events),
-    }
-
-
-def _dedupe_events(events):
-    best = {}
     for event in events:
-        event_id = event["event_id"]
-        existing = best.get(event_id)
-        if existing is None or event["score"] > existing["score"]:
-            best[event_id] = event
-    return list(best.values())
+        raw = event.get("raw_text") or ""
+        if not raw:
+            event["query_sim"] = 0.0
+            continue
+        try:
+            r_emb = get_embedding(raw)
+            event["query_sim"] = float(cosine_similarity(q_emb, r_emb))
+        except Exception:
+            event["query_sim"] = 0.0
+
+    return events
 
 
-def class_based_events(graph, query, now=None):
+def _entity_match_score(event, entities, query):
     """
-    Retrieve by stored memory class when the query asks about durable memory,
-    chronic facts, or long-term relevance. This uses the rich graph columns
-    directly instead of relying only on semantic entity search.
+    Token-based entity matching — kept as a lightweight supplement to
+    semantic scoring. Only used as a bonus signal, not a gate.
     """
-    query_tokens = _tokens(query)
-    if not (query_tokens & CHRONIC_QUERY_TERMS):
-        return []
+    if not entities:
+        entities = [{"text": t, "type": "other"} for t in _tokens(query)]
+    if not entities:
+        return 0.0, []
 
-    now = now or datetime.now(timezone.utc)
-    events = []
-    class_events = graph.nodes[
+    searchable = " ".join([
+        str(event.get("name") or ""),
+        str(event.get("raw_text") or ""),
+        str(event.get("event_type") or ""),
+        " ".join(s["name"] for s in event.get("states", [])),
+    ]).lower()
+    s_tokens = _tokens(searchable)
+
+    matched = []
+    for entity in entities:
+        text = normalize_concept(entity["text"])
+        if not text:
+            continue
+        for variant in _term_variants(text):
+            v_tokens = _tokens(variant)
+            if not v_tokens:
+                continue
+            if variant in searchable or v_tokens.issubset(s_tokens) or (
+                len(v_tokens) == 1 and bool(v_tokens & s_tokens)
+            ):
+                matched.append(variant)
+                break
+
+    return (len(set(matched)) / max(len(entities), 1), sorted(set(matched)))
+
+
+def rerank_events(events, query_plan, query):
+    """
+    Final scoring combining all three signals.
+    No event is hard-discarded here — everything that made it through
+    traversal gets a chance. Low-scoring events naturally fall to the bottom.
+    """
+    entities = [
+        e for e in query_plan.get("entities", [])
+        if e.get("type") != "time" and normalize_concept(e.get("text"))
+    ]
+
+    reranked = []
+    for event in events:
+        entity_score, matched = _entity_match_score(event, entities, query)
+        event["entity_match_score"] = entity_score
+        event["matched_entities"]   = matched
+
+        g  = min(event.get("graph_score", 0.0), 1.5)
+        t  = min(event.get("relevance_score", 0.0), 1.0)
+        s  = event.get("query_sim", 0.0)
+        em = entity_score   # 0–1 bonus for literal entity hits
+
+        # C5 safety floor: guarantees chronic facts appear for direct
+        # C5 queries (e.g. "what conditions do I have") but only adds
+        # a small bump — semantic relevance still dominates.
+        # Formula: floor is scaled by query_sim so it's only meaningful
+        # when the C5 event is actually related to the query.
+        is_c5 = event.get("impact_class") == "C5"
+        c5_bonus = (0.10 + s * 0.15) if is_c5 else 0.0
+
+        event["score"] = (
+            s  * W_SEMANTIC  +
+            t  * W_TEMPORAL  +
+            g  * W_GRAPH     +
+            em * 0.20        +
+            c5_bonus
+        )
+
+        reranked.append(event)
+
+    reranked.sort(key=lambda e: e["score"], reverse=True)
+    return reranked
+
+
+# ── Chronic fact supplementation ───────────────────────────────────────────
+
+def _always_on_c5_events(graph, now, query):
+    """
+    C5 (Chronic) events are always included in the bundle as a supplementary
+    band. These are permanent health facts (diagnoses, allergies, long-term
+    meds) that a health assistant should always be aware of.
+    Previously gated by "chronic" keyword — now always runs.
+    """
+    now    = now or datetime.now(timezone.utc)
+    q_emb  = None
+    try:
+        q_emb = get_embedding(query)
+    except Exception:
+        pass
+
+    results = []
+    c5_nodes = graph.nodes[
         (graph.nodes["type"] == "event") &
         (graph.nodes["impact_class"] == "C5")
     ]
 
-    for _, event in class_events.iterrows():
+    for _, row in c5_nodes.iterrows():
+        md        = _metadata(row)
+        relevance = score_node_relevance(row.to_dict(), now)
+        query_sim = 0.0
+        if q_emb is not None:
+            raw = md.get("raw_text", "")
+            try:
+                query_sim = float(cosine_similarity(q_emb, get_embedding(raw)))
+            except Exception:
+                pass
+
+        hit = {
+            "row":             row,
+            # C5 graph_score is driven purely by query similarity.
+            # No free 0.80 — that was causing irrelevant chronic events
+            # (e.g. peanut allergy when asking about nausea) to rank
+            # above actually relevant events.
+            "graph_score":     query_sim,
+            "relevance_score": relevance,
+            "paths":           [],
+        }
+        ev = _build_evidence(graph, hit, query_sim)
+        results.append(ev)
+
+    return results
+
+
+# ── Lexical fallback ───────────────────────────────────────────────────────
+
+def _lexical_fallback(graph, query, now):
+    """Last resort when embedding seeds are empty (offline / model down)."""
+    q_tokens = _tokens(query)
+    results  = []
+
+    for _, event in graph.nodes[graph.nodes["type"] == "event"].iterrows():
+        md       = _metadata(event)
+        raw_tok  = _tokens(md.get("raw_text", ""))
+        score    = len(q_tokens & raw_tok)
+        if score <= 0:
+            continue
         relevance = score_node_relevance(event.to_dict(), now)
-        events.append(_event_to_evidence(
+        results.append(_build_evidence(
             graph,
-            event,
-            graph_score=1.0,
-            relevance_score=relevance,
-            paths=[[{
-                "node_id": event["node_id"],
-                "name": event["canonical_name"],
-                "type": "event",
-                "matched_entity": "impact_class:C5",
-                "seed_score": 1.0,
-            }]],
+            {"row": event, "graph_score": float(score), "relevance_score": relevance, "paths": []},
+            query_sim=0.0,
         ))
 
-    return events
+    results.sort(key=lambda e: e["graph_score"], reverse=True)
+    return results
 
 
-def rerank_events(events, query_plan, query):
-    reranked = []
-    for event in events:
-        entity_score, matched_entities = _entity_match_score(event, query_plan, query)
-        event["entity_match_score"] = entity_score
-        event["matched_entities"] = matched_entities
-
-        graph_component = min(event.get("graph_score", 0.0), 1.25)
-        relevance_component = min(event.get("relevance_score", 0.0), 1.0)
-        class_bonus = _class_query_bonus(event, query)
-
-        # Query match should dominate. Relevance is a memory prior, not a
-        # reason to retrieve unrelated events.
-        event["score"] = (
-            entity_score * 3.0 +
-            graph_component * 0.8 +
-            relevance_component * 0.35 +
-            class_bonus
-        )
-
-        # For LLM-planned queries, discard events that have no entity/class
-        # explanation. This prevents high-relevance chronic or cyclic records
-        # from crowding out the actual question.
-        if query_plan.get("source") == "llm" and entity_score == 0 and class_bonus == 0:
-            continue
-
-        reranked.append(event)
-
-    reranked.sort(key=lambda item: item["score"], reverse=True)
-    return reranked
+def _dedupe(events):
+    best = {}
+    for e in events:
+        eid = e["event_id"]
+        if eid not in best or e["score"] > best[eid]["score"]:
+            best[eid] = e
+    return list(best.values())
 
 
-def _entity_match_score(event, query_plan, query):
-    entities = [
-        entity for entity in query_plan.get("entities", [])
-        if entity.get("type") != "time" and normalize_concept(entity.get("text"))
-    ]
-
-    if not entities:
-        entities = [{"text": token, "type": "other"} for token in _tokens(query)]
-
-    if not entities:
-        return 0.0, []
-
-    searchable_text = _event_search_text(event)
-    searchable_tokens = _tokens(searchable_text)
-    matched = []
-
-    for entity in entities:
-        text = normalize_concept(entity["text"])
-        for variant in _term_variants(text):
-            entity_tokens = _tokens(variant)
-            if not entity_tokens:
-                continue
-
-            phrase_match = variant in searchable_text
-            token_match = entity_tokens.issubset(searchable_tokens)
-            partial_match = bool(entity_tokens & searchable_tokens) and len(entity_tokens) == 1
-
-            if phrase_match or token_match or partial_match:
-                matched.append(variant)
-                break
-
-    if not matched:
-        return 0.0, []
-
-    return len(set(matched)) / max(len(entities), 1), sorted(set(matched))
-
-
-def _event_search_text(event):
-    state_names = " ".join(state["name"] for state in event.get("states", []))
-    return " ".join([
-        str(event.get("name") or ""),
-        str(event.get("raw_text") or ""),
-        str(event.get("event_type") or ""),
-        state_names,
-    ]).lower()
-
-
-def _class_query_bonus(event, query):
-    query_tokens = _tokens(query)
-    if (query_tokens & CHRONIC_QUERY_TERMS) and event.get("impact_class") == "C5":
-        return 2.0
-    if "recurring" in query_tokens and event.get("is_cyclic"):
-        return 1.0
-    return 0.0
-
-
-def _infer_missing_information(query_plan, events):
+def _infer_missing(query_plan, events):
     missing = []
     if not events:
-        return ["No matching events were found in the graph."]
-
+        return ["No matching events found in the health graph."]
     has_trigger = any(
-        state["relation"] == "TRIGGERED_BY"
-        for event in events
-        for state in event.get("states", [])
+        s["relation"] == "TRIGGERED_BY"
+        for e in events
+        for s in e.get("states", [])
     )
     if query_plan.get("intent") == "cause" and not has_trigger:
-        missing.append("No explicit trigger or exposure was linked to the retrieved events.")
-
-    if not any(event.get("event_time") for event in events):
-        missing.append("Retrieved events do not have reliable event_time values.")
-
+        missing.append("No explicit trigger was linked to the retrieved events.")
     return missing
 
 
+# ── Public API ─────────────────────────────────────────────────────────────
+
+def build_evidence_bundle(graph, query, limit=20, now=None):
+    """
+    Full retrieval pipeline. Returns a bundle dict consumed by the generator.
+
+    The bundle separates two kinds of context:
+      events          — top ranked, query-relevant events (beam + semantic)
+      background_facts — C5 chronic facts, always included as context but
+                         NOT competing in the main ranked list. This prevents
+                         diabetes/allergy records from crowding out the events
+                         that actually answer the current question.
+    """
+    now        = now or datetime.now(timezone.utc)
+    query_plan = extract_query_entities(query)
+
+    # ── Phase 1: Seeds ──────────────────────────────────────────────────
+    seeds = find_seed_nodes(graph, query_plan["entities"])
+
+    # ── Phase 2: Beam traversal ─────────────────────────────────────────
+    hits  = beam_search_events(graph, seeds, now=now) if seeds else []
+
+    if not hits:
+        events = _lexical_fallback(graph, query, now)
+    else:
+        events = [_build_evidence(graph, h) for h in hits]
+
+    # ── Phase 3: Semantic scoring + reranking ───────────────────────────
+    events = _score_semantic(events, query)
+    events = rerank_events(events, query_plan, query)
+    top    = events[:limit]
+
+    # ── Phase 4: C5 background facts (separate band, not ranked) ────────
+    # Score them semantically so the generator knows which ones are most
+    # relevant to the current question, but keep them out of the main list.
+    background = _always_on_c5_events(graph, now, query)
+    background = _score_semantic(background, query)
+    background.sort(key=lambda e: e.get("query_sim", 0.0), reverse=True)
+
+    return {
+        "query":               query,
+        "query_time":          now.isoformat(),
+        "query_plan":          query_plan,
+        "seed_nodes":          seeds[:20],
+        "events":              top,
+        "background_facts":    background,
+        "missing_information": _infer_missing(query_plan, top),
+    }
+
+
 def retrieve_relevant_events(graph, query, limit=5, now=None):
-    """
-    Backward-compatible API: returns the top event evidence list.
-    Prefer build_evidence_bundle() when calling the generator.
-    """
-    bundle = build_evidence_bundle(graph, query, limit=limit, now=now)
-    return bundle["events"]
-
-
-def lexical_event_fallback(graph, query, now=None):
-    """
-    Last-resort retrieval when embedding seeds are unavailable or empty.
-    This keeps local tests and degraded mobile/offline modes usable, while the
-    primary path remains embedding seed search + graph traversal.
-    """
-    now = now or datetime.now(timezone.utc)
-    query_tokens = _tokens(query)
-    events = []
-
-    for _, event in graph.nodes[graph.nodes["type"] == "event"].iterrows():
-        md = _metadata(event)
-        raw_tokens = _tokens(md.get("raw_text", ""))
-        state_names = {
-            state["name"]
-            for state in _event_context(graph, event["node_id"])
-        }
-        event_type = event.get("event_type") or md.get("event_type")
-
-        score = len(query_tokens & raw_tokens)
-        if event_type in query_tokens:
-            score += 2
-        for state_name in state_names:
-            if state_name in query_tokens:
-                score += 3
-
-        if score <= 0:
-            continue
-
-        relevance = score_node_relevance(event.to_dict(), now)
-        events.append(_event_to_evidence(
-            graph,
-            event,
-            float(score),
-            relevance,
-            [[{
-                "node_id": event["node_id"],
-                "name": event["canonical_name"],
-                "type": "event",
-                "matched_entity": "lexical fallback",
-                "seed_score": score,
-            }]],
-        ))
-
-    events.sort(key=lambda item: item["score"], reverse=True)
-    return events
+    """Backward-compatible shim."""
+    return build_evidence_bundle(graph, query, limit=limit, now=now)["events"]
