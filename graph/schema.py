@@ -1,3 +1,7 @@
+import warnings
+# Ignore the annoying Pandas concatenation warning for empty DataFrames
+warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
+
 import pandas as pd
 import numpy as np
 import uuid
@@ -5,6 +9,7 @@ from datetime import datetime, timezone
 
 
 def generate_id():
+# ...
     return str(uuid.uuid4())
 
 
@@ -36,36 +41,50 @@ EVENT_COLUMNS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Decay configuration (Shared across pipeline and episodes)
+# ---------------------------------------------------------------------------
+
+IMPACT_CLASS_CONFIG = {
+    "C1": {"lambda_hr": 0.030,  "label": "Transient",  "half_life_hrs": 23},
+    "C2": {"lambda_hr": 0.006,  "label": "Short-term", "half_life_hrs": 116},
+    "C3": {"lambda_hr": 0.0009, "label": "Acute",      "half_life_hrs": 770},
+    "C4": {"lambda_hr": 0.0001, "label": "Persistent", "half_life_hrs": 6931},
+    "C5": {"lambda_hr": 0.0,    "label": "Chronic",    "half_life_hrs": None},
+    "C6": {"lambda_hr": 0.001,  "label": "Cyclic",     "half_life_hrs": 693},
+}
+
+
 class HealthGraph:
     def __init__(self):
         # ------------------------------------------------------------------
         # Nodes table
         # Core identity columns + all promoted event decay columns.
-        # Non-event nodes (state, episode) will have None in the event cols.
         # ------------------------------------------------------------------
         node_columns = [
-            "node_id",
-            "type",              # state | event | episode
-            "name",
-            "canonical_name",
-            "embedding",         # np.array or None
-            "metadata",          # full raw dict (always kept for completeness)
-            "created_at",
+            "node_id", "type", "name", "canonical_name", "embedding", 
+            "metadata", "created_at"
         ] + EVENT_COLUMNS
 
-        self.nodes = pd.DataFrame(columns=node_columns)
+        # Define explicit dtypes for EVERY column to prevent concat inference issues
+        dtypes = {
+            "node_id": str, "type": str, "name": str, "canonical_name": str,
+            "created_at": str, "event_type": str, "event_time": str,
+            "impact_class": str, "severity_band": str, "S0": float,
+            "lambda_hr": float, "cyclic_candidate": bool, "is_cyclic": bool,
+            "cyclic_period_hrs": float, "occurrence_count": float,
+            # 'embedding' and 'metadata' are object-type
+        }
+        
+        self.nodes = pd.DataFrame(columns=node_columns).astype({
+            k: v for k, v in dtypes.items() if k in node_columns
+        })
 
-        # ------------------------------------------------------------------
-        # Edges table — unchanged from original
-        # ------------------------------------------------------------------
         self.edges = pd.DataFrame(columns=[
-            "edge_id",
-            "source_id",
-            "target_id",
-            "relation",
-            "timestamp",
-            "metadata",
-        ])
+            "edge_id", "source_id", "target_id", "relation", "timestamp", "metadata"
+        ]).astype({
+            "edge_id": str, "source_id": str, "target_id": str, "relation": str, "timestamp": str
+        })
 
     # -----------------------------------------------------------------------
     # Helpers: extract promoted fields from metadata dict
@@ -122,10 +141,11 @@ class HealthGraph:
             **event_cols,
         }
 
-        self.nodes = pd.concat(
-            [self.nodes, pd.DataFrame([new_node])],
-            ignore_index=True
-        )
+        new_df = pd.DataFrame([new_node], columns=self.nodes.columns)
+        if self.nodes.empty:
+            self.nodes = new_df
+        else:
+            self.nodes = pd.concat([self.nodes, new_df], ignore_index=True)
         return node_id
 
     def add_edge(self, source_id, target_id, relation, metadata=None):
@@ -150,10 +170,11 @@ class HealthGraph:
             "metadata":  metadata or {},
         }
 
-        self.edges = pd.concat(
-            [self.edges, pd.DataFrame([new_edge])],
-            ignore_index=True
-        )
+        new_df = pd.DataFrame([new_edge], columns=self.edges.columns)
+        if self.edges.empty:
+            self.edges = new_df
+        else:
+            self.edges = pd.concat([self.edges, new_df], ignore_index=True)
         return edge_id
 
     # -----------------------------------------------------------------------

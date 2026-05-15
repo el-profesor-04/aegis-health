@@ -240,12 +240,15 @@ def main():
         print(f"\n  Answer:\n    {res['answer']}")
 
         # Memories
+        qtype = res.get("query_type", "?")
+        print(f"\n  Query type: {qtype}")
         print(f"\n  Memories retrieved ({len(memories)}):")
         for m in memories:
             matched = ", ".join(m.get("matched") or []) or "—"
-            text    = (m.get("text") or "")[:78]
-            print(f"    [{m.get('event_type','?'):10}] [{m.get('impact_class','?'):2}] "
-                  f"matched=({matched})")
+            text    = (m.get("text") or "")[:75]
+            cls     = m.get("impact_class") or "?"
+            score   = m.get("score", 0.0)
+            print(f"    [{m.get('event_type','?'):10}] [{cls:2}] score={score:.2f} matched=({matched})")
             print(f"               \"{text}\"")
 
         # Coverage

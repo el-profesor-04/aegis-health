@@ -3,37 +3,23 @@ from ingestion.canonicalizer import (
     resolve_or_create,
     normalize_concept,
     normalize_body_part,
-    resolve_body_node_pairs
+    resolve_body_node_pairs,
+    LATERALITY_VALUES
 )
 from ingestion.episodes import attach_episode
+from graph.schema import IMPACT_CLASS_CONFIG
+from utils.embedding import get_embedding, get_embeddings_batch
 from datetime import datetime, timedelta, timezone
 
 
 def _utc_now():
+# ...
     return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
 # Decay configuration
 # ---------------------------------------------------------------------------
-
-# Lambda (λ) per impact class: hourly decay constant for the formula
-#   Relevance(t) = S0 * B * e^(-lambda_hr * t_hours)
-#
-# Values chosen so relevance drops below 5% of S0 at the practical
-# end of each class's real-world lifespan:
-#   C1 → gone in ~3 days     (λ = 0.030 → half-life 23 hrs)
-#   C2 → gone in ~2 weeks    (λ = 0.006 → half-life ~5 days)
-#   C3 → gone in ~4 months   (λ = 0.0009 → half-life ~32 days)
-#   C4 → gone in ~3 years    (λ = 0.0001 → half-life ~9 months)
-#   C5 → never decays        (λ = 0.0)
-IMPACT_CLASS_CONFIG = {
-    "C1": {"lambda_hr": 0.030,  "label": "Transient",  "half_life_hrs": 23},
-    "C2": {"lambda_hr": 0.006,  "label": "Short-term", "half_life_hrs": 116},
-    "C3": {"lambda_hr": 0.0009, "label": "Acute",      "half_life_hrs": 770},
-    "C4": {"lambda_hr": 0.0001, "label": "Persistent", "half_life_hrs": 6931},
-    "C5": {"lambda_hr": 0.0,    "label": "Chronic",    "half_life_hrs": None},
-}
 
 # S0 anchor values: initial relevance score at t=0
 SEVERITY_BAND_S0 = {
@@ -197,31 +183,55 @@ def ingest_text(graph, user_input, reference_time=None):
     event_time        = temporal_metadata["event_time"]
     decay_metadata    = build_decay_metadata(data)
 
+    # Step 2: Prepare entities for batch embedding
     symptom    = normalize_concept(data.get("symptom"))
     body_parts = [
         normalize_body_part(bp)
         for bp in data.get("body_parts", [])
         if normalize_body_part(bp)
     ]
+    trigger = normalize_concept(data.get("trigger"))
+    laterality = normalize_concept(data.get("laterality"))
 
-    # Step 2: Resolve state/entity nodes
-    symptom_id = resolve_or_create(graph, symptom, "state")
+    # Collect all strings that need embedding to save round-trips
+    to_embed = [user_input]
+    if symptom: to_embed.append(symptom)
+    if trigger: to_embed.append(trigger)
+
+    body_part_strings = []
+    for bp in body_parts:
+        body_part_strings.append(bp)
+        if laterality in LATERALITY_VALUES:
+            body_part_strings.append(f"{laterality} {bp}")
+
+    to_embed.extend(body_part_strings)
+
+    # Batch embed everything (one network call instead of many)
+    embeddings = get_embeddings_batch(to_embed)
+    emb_map = dict(zip(to_embed, embeddings))
+
+    event_embedding = emb_map.get(user_input)
+
+    # Step 3: Resolve state/entity nodes (using pre-computed embeddings)
+    symptom_id = resolve_or_create(graph, symptom, "state", embedding=emb_map.get(symptom))
 
     body_pairs = resolve_body_node_pairs(
         graph,
         body_parts,
-        data.get("laterality")
+        laterality,
+        embedding_map=emb_map
     )
 
-    trigger_id = resolve_or_create(graph, data.get("trigger"), "state")
+    trigger_id = resolve_or_create(graph, trigger, "state", embedding=emb_map.get(trigger))
 
-    # Step 3: Create event node with full metadata
+    # Step 4: Create event node with full metadata
     canonical_name = _build_event_canonical_name(data)
 
     event_id = graph.add_node(
         node_type="event",
         name=canonical_name,
         canonical_name=canonical_name,
+        embedding=event_embedding,
         metadata={
             "raw_text":   user_input,
             "event_type": data.get("event_type"),
@@ -230,16 +240,18 @@ def ingest_text(graph, user_input, reference_time=None):
         }
     )
 
-    # Step 4: Attach to episode (symptom-driven; gracefully skipped if no symptom)
+    # Step 5: Attach to episode (symptom-driven; gracefully skipped if no symptom)
     attach_episode(
         graph,
         symptom,
         body_parts,
         event_id,
-        event_time
+        event_time,
+        impact_class=data.get("impact_class", "C1"),
+        event_type=data.get("event_type", "symptom")
     )
 
-    # Step 5: Create edges
+    # Step 6: Create edges
     if symptom_id:
         graph.add_edge(event_id, symptom_id, "HAS_SYMPTOM")
 

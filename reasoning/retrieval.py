@@ -43,7 +43,8 @@ from utils.relevance import score_node_relevance
 client = OpenAI(
     base_url="http://localhost:1234/v1",
     api_key="lm-studio",
-    max_retries=0,
+    max_retries=1,
+    timeout=60.0,
 )
 
 
@@ -89,38 +90,16 @@ STOPWORDS = {
 # ── Query entity extraction ────────────────────────────────────────────────
 
 QUERY_EXTRACTION_PROMPT = """
-You extract search entities from a user's health question.
-
-Return ONLY valid JSON. No markdown or explanation.
+Extract search entities from a health question. Return ONLY JSON.
 
 Schema:
 {
-  "entities": [
-    {
-      "text": string,
-      "type": "symptom | body_part | trigger | food | medication | activity | condition | time | other"
-    }
-  ],
+  "entities": [{"text": "clinical term", "type": "symptom|body_part|trigger|food|medication|activity|other"}],
   "intent": "cause | timeline | recurrence | status | general"
 }
 
-Rules:
-- Use concise SNOMED-style clinical terms where possible.
-- Prefer singular canonical terms: "migraine" not "migraines".
-- Include symptoms, body parts, foods, medications, activities, conditions, triggers.
-- Do not include filler words.
-- Keep each entity short (1–3 words).
-
-Example:
-Input: "Could sushi from yesterday have caused my nausea?"
-Output:
-{
-  "entities": [
-    {"text": "sushi", "type": "food"},
-    {"text": "nausea", "type": "symptom"}
-  ],
-  "intent": "cause"
-}
+Example: "Could sushi from yesterday have caused my nausea?"
+{"entities": [{"text": "sushi", "type": "food"}, {"text": "nausea", "type": "symptom"}], "intent": "cause"}
 """
 
 
@@ -572,6 +551,13 @@ def rerank_events(events, query_plan, query):
         reranked.append(event)
 
     reranked.sort(key=lambda e: e["score"], reverse=True)
+
+    # Drop events that scored below the noise floor.
+    # Relevant events typically score 0.25–0.80; irrelevant ones cluster below 0.12.
+    # This prevents ankle events appearing in headache answers etc.
+    MIN_FINAL_SCORE = 0.10
+    reranked = [e for e in reranked if e["score"] >= MIN_FINAL_SCORE]
+
     return reranked
 
 

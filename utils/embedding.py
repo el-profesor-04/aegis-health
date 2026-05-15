@@ -17,6 +17,25 @@ def get_embedding(text: str):
 
     return np.array(response.data[0].embedding)
 
+def get_embeddings_batch(texts: list[str]) -> list[np.ndarray]:
+    """Fetch embeddings for a list of strings in a single batch call."""
+    if not texts:
+        return []
+        
+    # Filter out None/empty
+    valid_texts = [t for t in texts if t]
+    if not valid_texts:
+        return [None] * len(texts)
+        
+    response = client.embeddings.create(
+        model="text-embedding-qwen3-embedding-0.6b",
+        input=valid_texts
+    )
+    
+    # Map back to original order
+    embeddings_map = {t: np.array(emb.embedding) for t, emb in zip(valid_texts, response.data)}
+    return [embeddings_map.get(t) for t in texts]
+
 def cosine_similarity(a, b):
     if a is None or b is None:
         return -1

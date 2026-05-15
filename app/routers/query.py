@@ -9,14 +9,23 @@ router = APIRouter(prefix="/query", tags=["query"])
 
 
 def _memory_preview(event):
+    # impact_label is set by pipeline ("Transient", "Acute" etc)
+    # fall back to impact_class code (C1–C5) if label missing
+    impact = (
+        event.get("impact_label")
+        or event.get("impact_class")
+        or "?"
+    )
     return {
-        "event_id": event.get("event_id"),
-        "text": event.get("raw_text"),
-        "event_time": event.get("event_time"),
-        "event_type": event.get("event_type"),
+        "event_id":    event.get("event_id"),
+        "text":        event.get("raw_text"),
+        "event_time":  event.get("event_time"),
+        "event_type":  event.get("event_type"),
+        "impact_class": event.get("impact_class"),
         "severity_band": event.get("severity_band"),
-        "memory_type": event.get("impact_label") or event.get("impact_class"),
-        "matched": event.get("matched_entities", []),
+        "memory_type": impact,
+        "matched":     event.get("matched_entities", []),
+        "score":       round(event.get("score", 0.0), 3),
     }
 
 
@@ -34,7 +43,7 @@ def query(request: QueryRequest, graph=Depends(get_graph)):
             answer=result["answer"],
             memories=[
                 _memory_preview(event)
-                for event in result.get("events", [])[: min(request.limit, 10)]
+                for event in result.get("events", [])[:min(request.limit, 10)]
             ],
             query_plan=bundle.get("query_plan", {}),
             missing_information=bundle.get("missing_information", []),

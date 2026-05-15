@@ -25,6 +25,7 @@ New joining logic:
 
 from datetime import datetime, timezone
 from utils.embedding import get_embedding, cosine_similarity
+from graph.schema import IMPACT_CLASS_CONFIG
 
 
 # ── Similarity threshold for concept matching ─────────────────────────────
@@ -33,17 +34,10 @@ from utils.embedding import get_embedding, cosine_similarity
 # "migraine" and "migraine" (~1.0) always merge.
 EPISODE_SIM_THRESHOLD = 0.80
 
-# ── Class-aware grouping windows ──────────────────────────────────────────
-# How many days after an episode's last_event_at a new event of that class
-# can still join. None = no limit (C5 chronic episodes never close).
-CLASS_WINDOW_DAYS = {
-    "C1": 3,     # Transient — same multi-day spell only
-    "C2": 14,    # Short-term — up to 2 weeks of accumulated pattern
-    "C3": 60,    # Acute — injury/infection recovery arc
-    "C4": 120,   # Persistent/recurring — same recurring condition
-    "C5": None,  # Chronic — always open
-    "C6": 30,    # Cyclic — within a cycle
-}
+# ── Dynamic joining window ────────────────────────────────────────────────
+# How many half-lives an event can be away from an episode's last event 
+# and still join. 3.0 covers ~87.5% of the "influence" of the previous event.
+WINDOW_HALF_LIFE_MULTIPLIER = 3.0
 
 # ── Event types allowed to create/join episodes ───────────────────────────
 # C1 food/sleep/activity events are ephemeral — not worth an episode node.
@@ -101,8 +95,8 @@ def _within_class_window(event_time, episode_last_event_at, impact_class):
     Returns True when the gap is within the class-appropriate window.
     C5 always returns True (no window).
     """
-    window_days = CLASS_WINDOW_DAYS.get(impact_class)
-    if window_days is None:
+    config = IMPACT_CLASS_CONFIG.get(impact_class)
+    if not config or config["half_life_hrs"] is None:
         return True   # C5: no limit
 
     t_event   = _parse_time(event_time)
@@ -111,6 +105,9 @@ def _within_class_window(event_time, episode_last_event_at, impact_class):
         return True   # missing timestamps: don't block joining
 
     gap_days = abs((t_event - t_episode).total_seconds()) / 86400.0
+    
+    # window = multiplier * half_life
+    window_days = (config["half_life_hrs"] * WINDOW_HALF_LIFE_MULTIPLIER) / 24.0
     return gap_days <= window_days
 
 

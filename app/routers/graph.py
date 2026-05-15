@@ -1,15 +1,35 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from app.dependencies import get_graph
 from app.schemas import EventResponse, GraphClearResponse, GraphSummaryResponse
+from reasoning.knowledge import clear_knowledge_base
+from reasoning.engine import generate_clinical_summary
+from reasoning.insight_engine import get_all_insights
 
 
 router = APIRouter(prefix="/graph", tags=["graph"])
 
 
+@router.get("/summary")
+def get_clinical_summary(graph=Depends(get_graph)):
+    summary = generate_clinical_summary(graph)
+    return {"summary": summary}
+
+
+@router.get("/insights")
+def get_insights(now: str = None, graph=Depends(get_graph)):
+    return get_all_insights(graph, now=now)
+
+
 @router.delete("", response_model=GraphClearResponse)
-def clear_graph(graph=Depends(get_graph)):
+def clear_graph(
+    include_knowledge_base: bool = Query(False, description="Also delete the first aid knowledge base"),
+    graph=Depends(get_graph)
+):
     graph.clear()
+    if include_knowledge_base:
+        clear_knowledge_base()
+        
     return GraphClearResponse(
         ok=True,
         node_count=len(graph.nodes),

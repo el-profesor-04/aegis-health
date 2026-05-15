@@ -3,3 +3,5 @@ openai
 sentence-transformers
 fastapi
 uvicorn
+beautifulsoup4 
+requests

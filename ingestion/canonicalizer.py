@@ -29,7 +29,7 @@ def find_candidates(embedding, nodes_df, node_type):
 
     return scored[:TOP_K]
 
-def resolve_or_create(graph, name, node_type):
+def resolve_or_create(graph, name, node_type, embedding=None):
     name = normalize_concept(name)
 
     if name is None:
@@ -42,7 +42,8 @@ def resolve_or_create(graph, name, node_type):
     if not exact.empty:
         return exact.iloc[0]["node_id"]
 
-    embedding = get_embedding(name)
+    if embedding is None:
+        embedding = get_embedding(name)
 
     candidates = find_candidates(embedding, graph.nodes, node_type)
 
@@ -64,31 +65,32 @@ def normalize_body_part(part):
 
     return normalize_concept(part)
 
-def resolve_body_nodes(graph, body_part, laterality):
+def resolve_body_nodes(graph, body_part, laterality, base_embedding=None, specific_embedding=None):
     if body_part is None:
         return None, None
 
     base_name = normalize_body_part(body_part)
-    base_id = resolve_or_create(graph, base_name, "state")
+    base_id = resolve_or_create(graph, base_name, "state", embedding=base_embedding)
 
     laterality = normalize_concept(laterality)
 
     if laterality in LATERALITY_VALUES:
         specific_name = f"{laterality} {base_name}"
-        specific_id = resolve_or_create(graph, specific_name, "state")
+        specific_id = resolve_or_create(graph, specific_name, "state", embedding=specific_embedding)
 
         return specific_id, base_id
 
     return base_id, None
 
 
-def resolve_body_node_pairs(graph, body_parts, laterality):
+def resolve_body_node_pairs(graph, body_parts, laterality, embedding_map=None):
     if body_parts is None:
         return []
 
     if isinstance(body_parts, str):
         body_parts = [body_parts]
 
+    embedding_map = embedding_map or {}
     pairs = []
     seen = set()
     for body_part in body_parts:
@@ -97,7 +99,18 @@ def resolve_body_node_pairs(graph, body_parts, laterality):
             continue
 
         seen.add(base_name)
-        specific_id, base_id = resolve_body_nodes(graph, base_name, laterality)
+        
+        base_emb = embedding_map.get(base_name)
+        spec_emb = None
+        lat = normalize_concept(laterality)
+        if lat in LATERALITY_VALUES:
+            spec_emb = embedding_map.get(f"{lat} {base_name}")
+
+        specific_id, base_id = resolve_body_nodes(
+            graph, base_name, laterality, 
+            base_embedding=base_emb, 
+            specific_embedding=spec_emb
+        )
         pairs.append({
             "specific_id": specific_id,
             "base_id": base_id,
