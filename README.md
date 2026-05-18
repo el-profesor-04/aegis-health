@@ -1,15 +1,15 @@
 # Aegis
 
-> **Frontend & Mobile App:** See [aegis-mobile](https://github.com/el-profesor-04/aegis-mobile) for the Flutter cross-platform application with on-device model execution and UI.
+> **Frontend & Mobile App:** See [aegis-mobile](https://github.com/el-profesor-04/aegis-mobile) for the Flutter Android application with on-device model execution and UI.
 
-Python backend, ML infrastructure, and temporal health graph database for the Aegis personal health reasoning system. Contains data processing pipelines, LiteRT model conversions, embedding generation, and the core SQLite-based temporal graph engine.
+Python backend, ML infrastructure, and temporal health graph database for the Aegis personal health reasoning system. Contains data processing pipelines, embedding generation, and the core SQLite-based temporal graph engine.
 
 ## Overview
 
 Aegis Backend provides the foundational ML and data infrastructure for the sovereign, offline health agent. It includes:
 
 - **Temporal Health Graph Database**: Custom semantic graph stored in SQLite with causal relationships and temporal decay
-- **LiteRT Model Conversion**: Gemma 4 E2B and MediaPipe BERT quantization for on-device execution
+- **Gemma 4 E2B & MediaPipe BERT**: LiteRT models for entity extraction, query routing, and semantic embeddings
 - **Entity Extraction & Embeddings**: Natural language processing for health event extraction and semantic retrieval
 - **Graph Reasoning Engine**: Three-phase retrieval pipeline for intelligent pattern discovery
 - **First Aid Knowledge Base**: 55 curated Mayo Clinic first aid articles embedded and searchable offline
@@ -48,6 +48,8 @@ Aegis uses Gemma 4 E2B via LiteRT-LM for three core NLP tasks:
 1. **Entity Extraction**: Parses user-logged health events into structured entities (symptom, medication, food, sleep hours, exercise duration, mood)
 2. **Query Routing**: Classifies user queries to determine which reasoning pathway (ingestion, history search, first aid RAG)
 3. **Answer Generation**: Generates natural language responses based on retrieved graph context
+
+The Gemma 4 E2B model is sourced pre-converted in LiteRT-LM format directly from Hugging Face.
 
 ### Offline Embeddings & Retrieval
 
@@ -107,7 +109,6 @@ aegis-health/
 │   ├── impact_classes.py            # Impact class definitions and decay
 │   └── schema.sql                   # SQLite schema
 ├── models/
-│   ├── gemma_converter.py           # Gemma 4 E2B → LiteRT conversion
 │   ├── bert_embedder.py             # MediaPipe BERT embedder wrapper
 │   └── quantization.py              # Quantization utilities
 ├── retrieval/
@@ -121,7 +122,6 @@ aegis-health/
 │   ├── entity_extractor.py          # Health event entity extraction
 │   └── graph_builder.py             # Graph node/edge construction
 ├── scripts/
-│   ├── convert_models.py            # Model conversion script
 │   ├── build_first_aid_db.py        # First aid DB initialization
 │   └── process_health_logs.py       # Health event batch processing
 ├── tests/
@@ -129,20 +129,6 @@ aegis-health/
 ├── requirements.txt                 # Python dependencies
 └── README.md
 ```
-
-## Model Conversion
-
-### Gemma 4 E2B to LiteRT
-
-```bash
-python scripts/convert_models.py --model gemma-4-e2b --format litert --output-dir ./models/litert
-```
-
-Converts the Gemma 4 E2B model to LiteRT format with INT8 quantization.
-
-### MediaPipe BERT Embedder
-
-The standard MediaPipe `bert_embedder.tflite` is included pre-quantized. No conversion required.
 
 ## SQLite Schema Overview
 
