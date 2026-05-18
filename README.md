@@ -188,6 +188,3 @@ Run tests with:
 pytest tests/
 ```
 
-## License
-
-Proprietary — Aegis Health
