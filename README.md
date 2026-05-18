@@ -1,44 +1,207 @@
-# 🧠 My System: The Aegis Health Graph
+# Aegis
 
-I’m building a system that behaves less like a tracker and more like a personal medical reasoning engine.
+> **Frontend & Mobile App:** See [aegis-mobile](https://github.com/el-profesor-04/aegis-mobile) for the Flutter cross-platform application with on-device model execution and UI.
 
-At a high level, I’m trying to solve this:
+Python backend, ML infrastructure, and temporal health graph database for the Aegis personal health reasoning system. Contains data processing pipelines, LiteRT model conversions, embedding generation, and the core SQLite-based temporal graph engine.
 
-People describe their health in messy, incomplete, time-relative language, and I want to convert that into a structured, evolving, queryable memory that can support reasoning.
+## Overview
 
+Aegis Backend provides the foundational ML and data infrastructure for the sovereign, offline health agent. It includes:
 
+- **Temporal Health Graph Database**: Custom semantic graph stored in SQLite with causal relationships and temporal decay
+- **LiteRT Model Conversion**: Gemma 4 E2B and MediaPipe BERT quantization for on-device execution
+- **Entity Extraction & Embeddings**: Natural language processing for health event extraction and semantic retrieval
+- **Graph Reasoning Engine**: Three-phase retrieval pipeline for intelligent pattern discovery
+- **First Aid Knowledge Base**: 55 curated Mayo Clinic first aid articles embedded and searchable offline
 
+All processing is designed to run locally on-device without cloud connectivity.
 
-Current Simplified Issues:
+## Architecture
 
-- Temporal metadata and event time in pipeline.py. There are a few if else conditions which define the event time and ultimately the temporal metadata. The user input can vary a lot and most likely wont fit into this simplified framework.
+### Temporal Health Graph
 
-- The symptom normalizer (canonicalizer.py) is basically just converting it into lowercase and has a limited CONCEPT_MAP defined for a handful of symptoms. The user input will most defintely contain tons of other symptoms and the system would have to rely on the LLM to produce normalized output in the first place.
+The core of Aegis is a semantic health graph stored in SQLite. Every logged health event creates a node with:
 
-- Same issue as in point 2, the normalize body part uses a similar limited BODY_PART_MAP.
+**Impact Classification**:
+- **C1 Transient**: Acute, one-time events (e.g., single dose of medication)
+- **C2 Short-term**: Events lasting hours to days
+- **C3 Medium-term**: Events lasting days to weeks
+- **C4 Long-term**: Events lasting weeks to months
+- **C5 Chronic**: Persistent conditions, indefinite lifespan
+- **C6 Cyclic**: Recurring patterns with predictable periods (e.g., hormonal cycles, weekly stressors)
 
-- Find best episode threshold is hardcoded to be > 0.6 episodes.py. And the way the score is calculated is a bit ambiguous, score += 0.5 sim ? how to come up with proper weighted equations. Also TIME_WINDOW_DAYS = 10 ? How to decide that value.
+**Relevance Scoring**:
+- Linear decay based on impact class for C1-C5
+- Modulo-arithmetic temporal alignment for C6 (cyclic nodes re-surface in ranking when current time aligns with predicted period)
+- Exponential decay function: `relevance(t) = initial_score × e^(-decay_rate × time_elapsed)`
 
-- For node similarities we might wanna use word embedding models instead of these sentence/text embedding models. Coz these always score really high.
+**Graph Edges**:
+- `TRIGGERED_BY`: Causal antecedent relationship
+- `HAS_SYMPTOM`: Symptom manifestation
+- `TARGETS`: Intervention or medication target
+- `PART_OF`: Temporal grouping or event composition
 
-- The current retriever system is pretty basic, it just scores based on overlapping tokens. And the retrieval engine is not connected to generator for answering.
+### Gemma 4 E2B & LiteRT Integration
 
+Aegis uses Gemma 4 E2B via LiteRT-LM for three core NLP tasks:
 
+1. **Entity Extraction**: Parses user-logged health events into structured entities (symptom, medication, food, sleep hours, exercise duration, mood)
+2. **Query Routing**: Classifies user queries to determine which reasoning pathway (ingestion, history search, first aid RAG)
+3. **Answer Generation**: Generates natural language responses based on retrieved graph context
 
-FEATS TO ADD:
+### Offline Embeddings & Retrieval
 
-- Notifications to clarify transient events like cyclic, Do you still go to tennis every week?
+**Phase 1 - Seed Finding**: 
+- User query embedded via MediaPipe BERT embedder
+- Cosine similarity search in SQLite vector store identifies top-k seed nodes
 
-- Relevancy calculations when on charge. To update DB. On idle use.
+**Phase 2 - Beam Traversal**:
+- Beam width: 50 candidates
+- Traversal depth: 5 hops
+- Explores causal edges (TRIGGERED_BY, HAS_SYMPTOM, TARGETS, PART_OF)
+- Maintains frontier of most-relevant nodes at each depth
 
-- Visualize health graph, use human animation object and maybe arrows pointing out of it.
+**Phase 3 - Reranking**:
+- Composite scoring: `score = semantic_similarity × temporal_relevance × causal_strength`
+- Final ranked results returned for context generation
 
-PENDING ITEMS:
+### First Aid RAG
 
-- EPISODE CONNECTIONS / MERGE
+55 curated Mayo Clinic first aid articles are embedded and stored in SQLite:
+- Titles embedded via MediaPipe BERT
+- Retrieval via cosine similarity at query time
+- All processing fully offline, no external dependencies
 
-- MULTI EVENT EXTRACTION
+## Installation
 
-- Second, self-contained events are under-modeled. For example, food/activity/sleep events can be valid without symptom/body/trigger, but there is no dedicated field like activity,food_item, medication, or sleep_metric. That means events like “Sunday run” may become just activity, and many different activities could collapse into the same canonical event name.
+### Prerequisites
 
-- Third, episodes are still using older heuristic logic: hardcoded TIME_WINDOW_DAYS = 10, score weights, and embedding similarity in aegis/ingestion/episodes.py:4. Compared to the newer impact/relevance layer, episodes are now the least mature part.
+- Python 3.10+
+- pip or conda
+
+### Setup
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/el-profesor-04/aegis-health.git
+   cd aegis-health
+   ```
+
+2. Create a virtual environment:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Project Structure
+
+```
+aegis-health/
+├── graph/
+│   ├── temporal_graph.py            # Core temporal graph engine
+│   ├── impact_classes.py            # Impact class definitions and decay
+│   └── schema.sql                   # SQLite schema
+├── models/
+│   ├── gemma_converter.py           # Gemma 4 E2B → LiteRT conversion
+│   ├── bert_embedder.py             # MediaPipe BERT embedder wrapper
+│   └── quantization.py              # Quantization utilities
+├── retrieval/
+│   ├── seed_finder.py               # Phase 1: seed finding
+│   ├── beam_search.py               # Phase 2: beam traversal
+│   └── reranker.py                  # Phase 3: reranking
+├── rag/
+│   ├── first_aid_db.py              # First aid knowledge base
+│   └── articles/                    # 55 Mayo Clinic articles
+├── processing/
+│   ├── entity_extractor.py          # Health event entity extraction
+│   └── graph_builder.py             # Graph node/edge construction
+├── scripts/
+│   ├── convert_models.py            # Model conversion script
+│   ├── build_first_aid_db.py        # First aid DB initialization
+│   └── process_health_logs.py       # Health event batch processing
+├── tests/
+│   └── ...                          # Unit and integration tests
+├── requirements.txt                 # Python dependencies
+└── README.md
+```
+
+## Model Conversion
+
+### Gemma 4 E2B to LiteRT
+
+```bash
+python scripts/convert_models.py --model gemma-4-e2b --format litert --output-dir ./models/litert
+```
+
+Converts the Gemma 4 E2B model to LiteRT format with INT8 quantization.
+
+### MediaPipe BERT Embedder
+
+The standard MediaPipe `bert_embedder.tflite` is included pre-quantized. No conversion required.
+
+## SQLite Schema Overview
+
+The temporal health graph is persisted in SQLite with the following primary tables:
+
+- `nodes`: Health events with impact class, timestamp, and semantic embedding
+- `edges`: Causal relationships between nodes (TRIGGERED_BY, HAS_SYMPTOM, TARGETS, PART_OF)
+- `first_aid_articles`: Curated first aid knowledge base with embeddings
+
+Indices are created on timestamp, impact_class, and embedding vectors for efficient retrieval.
+
+## Usage
+
+### Building the Graph from Health Logs
+
+```python
+from graph.temporal_graph import TemporalHealthGraph
+
+graph = TemporalHealthGraph(db_path="health.db")
+graph.add_node(
+    event_type="symptom",
+    description="headache",
+    impact_class="C2",
+    timestamp=1234567890
+)
+graph.add_edge(from_node_id=1, to_node_id=2, relationship="TRIGGERED_BY")
+```
+
+### Querying the Graph
+
+```python
+from retrieval.seed_finder import SeedFinder
+from retrieval.beam_search import BeamSearch
+from retrieval.reranker import Reranker
+
+seed_finder = SeedFinder(graph)
+seeds = seed_finder.find(query="Why do I get headaches after eating cheese?")
+
+beam_search = BeamSearch(graph, width=50, depth=5)
+candidates = beam_search.traverse(seeds)
+
+reranker = Reranker()
+final_results = reranker.rerank(candidates, query_embedding)
+```
+
+## Privacy & Security
+
+- **Offline-First**: All processing occurs on-device without cloud connectivity
+- **No Data Egress**: Health data never leaves the user's device
+- **Sovereign Computation**: Users retain complete control over their health data
+- **Local SQLite**: All graph data persists locally in encrypted SQLite
+
+## Testing
+
+Run tests with:
+```bash
+pytest tests/
+```
+
+## License
+
+Proprietary — Aegis Health
